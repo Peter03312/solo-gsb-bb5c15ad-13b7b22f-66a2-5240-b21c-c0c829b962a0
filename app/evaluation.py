@@ -25,7 +25,7 @@ from datetime import datetime
 from typing import Any, Iterable, Sequence
 
 from .models import Verdict
-from .timeutils import to_iso
+from .timeutils import round_duration, to_iso
 
 
 @dataclass(frozen=True)
@@ -88,7 +88,8 @@ class Segment:
             "start": to_iso(self.start),
             "end": to_iso(self.end),
             "status": self.status,
-            "duration_seconds": round(self.duration(), 3),
+            # 微秒精度呈现：采样时刻带微秒时，亚毫秒的区段时长差异也可见
+            "duration_seconds": round_duration(self.duration()),
         }
 
 
@@ -247,12 +248,15 @@ def evaluate(
     exceeded = [s for s in segments if s.status == "exceeded"]
     unknown = [s for s in segments if s.status == "unknown"]
 
-    max_continuous = round(_max_continuous_exceeded(segments), 3)
+    # 判定与输出分离：先按原始半开区段实际时长判定（datetime 差值，不做
+    # 任何舍入——1.0004s 严格超过 1.0002s 即不合格），再在输出时舍入到
+    # 微秒精度呈现。
+    max_continuous_raw = _max_continuous_exceeded(segments)
     has_exceeded = bool(exceeded)
     has_unknown = bool(unknown)
 
-    # “超过”才不合格：严格大于
-    if max_continuous > max_exceed_seconds:
+    # “超过”才不合格：严格大于（用原始时长比较，舍入仅用于输出）
+    if max_continuous_raw > max_exceed_seconds:
         verdict = Verdict.FAIL.value
     elif has_unknown:
         verdict = Verdict.PENDING.value
@@ -264,7 +268,7 @@ def evaluate(
         "normal_segments": [s.to_dict() for s in normal],
         "exceeded_segments": [s.to_dict() for s in exceeded],
         "unknown_segments": [s.to_dict() for s in unknown],
-        "max_continuous_exceeded_seconds": max_continuous,
+        "max_continuous_exceeded_seconds": round_duration(max_continuous_raw),
         "max_exceed_seconds": float(max_exceed_seconds),
         "has_exceeded": has_exceeded,
         "has_unknown": has_unknown,
@@ -275,7 +279,7 @@ def evaluate(
             {
                 "start": to_iso(f.start),
                 "end": to_iso(f.end),
-                "duration_seconds": round(f.duration(), 3),
+                "duration_seconds": round_duration(f.duration()),
             }
             for f in fault_union
         ],

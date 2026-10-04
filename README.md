@@ -85,6 +85,23 @@
 “最长连续超限”指相邻的超限区段时长之和，被正常/未知区段打断后重新累计。
 即使存在未知区段，只要超限超时，结论仍为不合格。
 
+> **采样时刻带微秒时的时长口径（重要）**：时间戳支持微秒（ISO-8601 小数秒，
+> 如 `2026-10-01T00:00:01.000400Z`），半开区段的实际时长因此可能出现亚毫秒
+> 差异。**单窗审定与跨窗复核的一切判定一律按原始半开区段的实际时长**
+> （相邻采样时刻之差）进行，**不做任何毫秒级预舍入**：
+> - 最长连续超限时长**严格大于**阈值才不合格——持续 `1.0004s`、阈值
+>   `1.0002s` 判**不合格**；恰好 `1.0004 == 1.0004` 判不超；
+> - **任意正时长**的未知区段（即使只有 `0.0004s`，小于毫秒半值
+>   `0.0005s`）都判**待定**；已有超限不合格时仍以**不合格优先**。
+>
+> 毫秒/微秒舍入只用于**输出呈现**：所有 `*_seconds` 时长字段统一保留到
+> **微秒（小数点后 6 位）**，足以呈现影响结论的微秒差异（字段结构不变；
+> 整秒值仍序列化为如 `600.0`）。
+> **已签发证书的结论与不可变快照不追改**；跨窗复核始终从各证快照记录的
+> 采样时刻重建半开区段，旧证参与复核时同样按上述原始微秒时长口径累计。
+> 后续签发、封存（快照与当前状态一致性核对）与核验包出具/核验仍按既有
+> 流程工作。
+
 ### 读数提交、幂等与修订
 
 读数以 `(reading_id, revision)` 标识，同一窗口内：
@@ -408,6 +425,10 @@
 - **结论判定（按优先级）**：全程最长连续超限时长**严格大于**全程上限 →
   **不合格**（即使存在未知仍判不合格）；否则只要存在未知总时长 → **待定**；
   其余 → **合格**。恰好等于上限不算超过。
+  判定按各证快照采样时刻还原的**原始半开区段实际时长**进行，不做毫秒
+  预舍入：跨边界累计 `1s + 1.0004s = 2.0004s`、全程上限 `2.0002s` 判
+  不合格；不足 `0.0005s` 的正时长未知区段（如边界晚读数 `0.0004s`）也判
+  待定；已有超限不合格时不合格优先。时长输出统一到微秒（6 位小数）。
 - **只读与一致性**：复核为只读操作，在同一显式读事务内取**同一已提交状态**
   完成全部核对，**不修改证书、读数、规则、故障登记或移交单**（HTTP 用
   `201` 仅表示“出具了一份复核结果”，不落任何记录，故无复核单号、可重复调用）。
@@ -1094,6 +1115,31 @@ curl -sS -X POST http://localhost:8000/api/v1/windows/1/certificates/issue \
   -H 'Content-Type: application/json' -d '{"note":"首签"}'
 ```
 
+微秒采样时刻最小示例（本轮口径；判定按原始半开区段实际时长，输出到微秒）：
+
+```bash
+# 单窗：窗口 2s、最长连续超限阈值 1.0002s；首段超限恰好 1.0004s -> fail
+curl -sS http://localhost:8000/api/v1/windows \
+  -H 'Content-Type: application/json' -d '{
+    "name":"微秒单窗","start_at":"2026-10-01T00:00:00Z",
+    "end_at":"2026-10-01T00:00:02Z",
+    "allowed_temp_min":18,"allowed_temp_max":22,
+    "max_continuous_exceed_seconds":1.0002,"max_sample_interval_seconds":1000}'
+# 时间戳可带 6 位小数秒（微秒）
+curl -sS http://localhost:8000/api/v1/windows/1/readings -H 'Content-Type: application/json' \
+  -d '{"reading_id":"a","revision":1,"measured_at":"2026-10-01T00:00:00.000000Z","temperature":25.0}'
+curl -sS http://localhost:8000/api/v1/windows/1/readings -H 'Content-Type: application/json' \
+  -d '{"reading_id":"b","revision":1,"measured_at":"2026-10-01T00:00:01.000400Z","temperature":20.0}'
+curl -sS http://localhost:8000/api/v1/windows/1/readings -H 'Content-Type: application/json' \
+  -d '{"reading_id":"c","revision":1,"measured_at":"2026-10-01T00:00:02.000000Z","temperature":20.0}'
+curl -sS http://localhost:8000/api/v1/windows/1/evaluation
+# -> {"verdict":"fail",
+#     "max_continuous_exceeded_seconds":1.0004,
+#     "exceeded_segments":[{"start":"...00:00:00Z","end":"...00:00:01.000400Z",
+#                           "status":"exceeded","duration_seconds":1.0004}]}
+# 阈值改为 1.0004（恰好等于）-> pass；首读晚于起点 0.0004s 的正时长未知 -> pending。
+```
+
 批量补传最小示例（互换采样时刻：`a`、`b` 同时以更高修订号改到对方原时刻）：
 
 ```bash
@@ -1251,6 +1297,20 @@ curl -sS -X POST http://localhost:8000/api/v1/cross-window-reviews \
 # 复核只读：不改证书/读数/规则/故障登记/移交单，可随时凭同一组证书重复调用。
 ```
 
+跨窗复核的微秒判定（承接两张首尾相接、各 2s 的当前可用证书 `$CC1`、`$CC2`：
+W1 末段超限 1s、W2 首段超限 1.0004s，跨边界连续 2.0004s）：
+
+```bash
+# 2.0004s 严格超过全程上限 2.0002s -> fail（逐段输出 1.0 / 1.0004，微秒差异可见）
+curl -sS -X POST http://localhost:8000/api/v1/cross-window-reviews \
+  -H 'Content-Type: application/json' \
+  -d '{"certificate_ids":['"$CC1"','"$CC2"'],"max_continuous_exceed_seconds":2.0002}'
+# -> {"verdict":"fail","max_continuous_exceeded_seconds":2.0004,
+#     "segments":[...,{"status":"exceeded","duration_seconds":1.0004,"source":{...}}]}
+# 上限给 2.0004（恰好等于）-> pass；
+# 任一窗存在 0.0004s 正时长未知区段且未超限 -> pending；同时超限仍 fail（不合格优先）。
+```
+
 证书核验包最小示例（承接一张已签发证书 `$CID`）：
 
 ```bash
@@ -1332,6 +1392,13 @@ pip install -r requirements.txt pytest
 PYTHONPATH=. python -m pytest tests/ -q
 ```
 
+- `tests/test_microsecond_precision.py`：微秒采样时刻判定纯函数回归
+  （单窗与跨窗：1.0004s vs 阈值 1.0002s 严格超限判 fail、恰好等阈值 pass、
+  0.0004s 正时长未知判 pending、不合格优先于待定、时长微秒呈现）。
+- `tests/test_microsecond_api.py`：微秒判定 HTTP 端到端回归（单窗审定/
+  跨窗复核 fail/pass/pending 与优先级、微秒时长输出、已签发证书结论与
+  不可变快照不追改、后续签发/封存（快照一致性核对）/核验包出具与核验
+  流程不回归、封存期只读与既有非法输入 422 语义不变）。
 - `tests/test_evaluation.py`：审定算法纯函数测试（未知/超限/合格、
   边界等于、时区归一、区段无缝拼接、故障时段并集/遮蔽/切断连续超限等）。
 - `tests/test_report.py`：修订影响报告纯函数测试（读数差异、带证据

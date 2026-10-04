@@ -635,3 +635,88 @@ api POST "/api/v1/windows/99999/seals" "{\"certificate_id\":$SCID2,\"reason\":\"
 api POST "/api/v1/windows/$SIDW/seals" '{"certificate_id":99999,"reason":"证书不存在"}' || true
 api POST "/api/v1/windows/1/seals" "{\"certificate_id\":$SCID2,\"reason\":\"他窗证书\"}" || true
 api POST "/api/v1/windows/$SIDW/seals" "{\"certificate_id\":$SCID2,\"reason\":\"   \"}" || true
+
+# ============================================================================
+# 21. 微秒采样时刻：按原始半开区段实际时长判定（本轮新增用法）
+# ============================================================================
+# 采样时刻支持 6 位小数秒（微秒）。判定一律用半开区段实际时长，不做毫秒
+# 预舍入：1.0004s 严格超过 1.0002s 判不合格；0.0004s 正时长未知判待定；
+# 不合格优先；时长字段输出到微秒（6 位小数），字段结构不变。
+echo "== 21.1 单窗：持续 1.0004s、阈值 1.0002s -> fail（旧毫秒舍入会误判 pass）=="
+USW=$(api POST /api/v1/windows '{
+  "name":"微秒单窗-超限",
+  "start_at":"2026-10-01T00:00:00Z","end_at":"2026-10-01T00:00:02Z",
+  "allowed_temp_min":18.0,"allowed_temp_max":22.0,
+  "max_continuous_exceed_seconds":1.0002,"max_sample_interval_seconds":1000}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+api POST "/api/v1/windows/$USW/readings" '{"reading_id":"a","revision":1,"measured_at":"2026-10-01T00:00:00.000000Z","temperature":25.0}' >/dev/null
+api POST "/api/v1/windows/$USW/readings" '{"reading_id":"b","revision":1,"measured_at":"2026-10-01T00:00:01.000400Z","temperature":20.0}' >/dev/null
+api POST "/api/v1/windows/$USW/readings" '{"reading_id":"c","revision":1,"measured_at":"2026-10-01T00:00:02.000000Z","temperature":20.0}' >/dev/null
+api GET "/api/v1/windows/$USW/evaluation" \
+  | python3 -c 'import sys,json;d=json.load(sys.stdin);print("verdict =",d["verdict"],"| max =",d["max_continuous_exceeded_seconds"],"| 超限段 =",[(s["end"],s["duration_seconds"]) for s in d["exceeded_segments"]])'
+
+echo "== 21.2 恰好等于阈值（1.0004 == 1.0004）-> pass（严格大于才算超限）=="
+URW=$(api POST /api/v1/windows '{
+  "name":"微秒单窗-等值",
+  "start_at":"2026-10-01T00:00:00Z","end_at":"2026-10-01T00:00:02Z",
+  "allowed_temp_min":18.0,"allowed_temp_max":22.0,
+  "max_continuous_exceed_seconds":1.0004,"max_sample_interval_seconds":1000}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+for body in \
+  '{"reading_id":"a","revision":1,"measured_at":"2026-10-01T00:00:00Z","temperature":25.0}' \
+  '{"reading_id":"b","revision":1,"measured_at":"2026-10-01T00:00:01.000400Z","temperature":20.0}' \
+  '{"reading_id":"c","revision":1,"measured_at":"2026-10-01T00:00:02Z","temperature":20.0}'; do
+  api POST "/api/v1/windows/$URW/readings" "$body" >/dev/null
+done
+api GET "/api/v1/windows/$URW/evaluation" | python3 -c 'import sys,json;d=json.load(sys.stdin);print("verdict =",d["verdict"])'
+
+echo "== 21.3 首读晚于起点 0.0004s：任意正时长未知 -> pending（旧逻辑舍入为 0 漏判）=="
+UPW=$(api POST /api/v1/windows '{
+  "name":"微秒单窗-未知",
+  "start_at":"2026-10-01T00:00:00Z","end_at":"2026-10-01T00:00:02Z",
+  "allowed_temp_min":18.0,"allowed_temp_max":22.0,
+  "max_continuous_exceed_seconds":1000,"max_sample_interval_seconds":1000}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+api POST "/api/v1/windows/$UPW/readings" '{"reading_id":"a","revision":1,"measured_at":"2026-10-01T00:00:00.000400Z","temperature":20.0}' >/dev/null
+api POST "/api/v1/windows/$UPW/readings" '{"reading_id":"b","revision":1,"measured_at":"2026-10-01T00:00:02Z","temperature":20.0}' >/dev/null
+api GET "/api/v1/windows/$UPW/evaluation" \
+  | python3 -c 'import sys,json;d=json.load(sys.stdin);print("verdict =",d["verdict"],"| unknown =",[s["duration_seconds"] for s in d["unknown_segments"]])'
+
+echo "== 21.4 跨窗复核：跨边界连续 1s + 1.0004s = 2.0004s，上限 2.0002s -> fail =="
+# W1 [00:00:00,00:00:02)：[0,1) 正常、[1,2) 超限 1s
+CW1=$(api POST /api/v1/windows '{
+  "name":"微秒跨窗-W1","start_at":"2026-10-01T00:00:00Z","end_at":"2026-10-01T00:00:02Z",
+  "allowed_temp_min":18.0,"allowed_temp_max":22.0,
+  "max_continuous_exceed_seconds":1000,"max_sample_interval_seconds":1000}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+api POST "/api/v1/windows/$CW1/readings" '{"reading_id":"a","revision":1,"measured_at":"2026-10-01T00:00:00Z","temperature":20.0}' >/dev/null
+api POST "/api/v1/windows/$CW1/readings" '{"reading_id":"b","revision":1,"measured_at":"2026-10-01T00:00:01Z","temperature":25.0}' >/dev/null
+api POST "/api/v1/windows/$CW1/readings" '{"reading_id":"c","revision":1,"measured_at":"2026-10-01T00:00:02Z","temperature":25.0}' >/dev/null
+CC1=$(api POST "/api/v1/windows/$CW1/certificates/issue" '{"note":"微秒跨窗W1"}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+# W2 [00:00:02,00:00:04)：[2,3.0004) 超限 1.0004s
+CW2=$(api POST /api/v1/windows '{
+  "name":"微秒跨窗-W2","start_at":"2026-10-01T00:00:02Z","end_at":"2026-10-01T00:00:04Z",
+  "allowed_temp_min":18.0,"allowed_temp_max":22.0,
+  "max_continuous_exceed_seconds":1000,"max_sample_interval_seconds":1000}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+api POST "/api/v1/windows/$CW2/readings" '{"reading_id":"d","revision":1,"measured_at":"2026-10-01T00:00:02Z","temperature":25.0}' >/dev/null
+api POST "/api/v1/windows/$CW2/readings" '{"reading_id":"e","revision":1,"measured_at":"2026-10-01T00:00:03.000400Z","temperature":20.0}' >/dev/null
+api POST "/api/v1/windows/$CW2/readings" '{"reading_id":"f","revision":1,"measured_at":"2026-10-01T00:00:04Z","temperature":20.0}' >/dev/null
+CC2=$(api POST "/api/v1/windows/$CW2/certificates/issue" '{"note":"微秒跨窗W2"}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+api POST /api/v1/cross-window-reviews "{\"certificate_ids\":[$CC1,$CC2],\"max_continuous_exceed_seconds\":2.0002}" \
+  | python3 -c 'import sys,json;d=json.load(sys.stdin);print("verdict =",d["verdict"],"| 全程最长 =",d["max_continuous_exceeded_seconds"],"| 超限段 =",[s["duration_seconds"] for s in d["segments"] if s["status"]=="exceeded"])'
+echo "   上限给 2.0004（恰好等于）-> pass："
+api POST /api/v1/cross-window-reviews "{\"certificate_ids\":[$CC1,$CC2],\"max_continuous_exceed_seconds\":2.0004}" \
+  | python3 -c 'import sys,json;print("   verdict =",json.load(sys.stdin)["verdict"])'
+
+echo "== 21.5 后续流程不回归：签发已按微秒口径；既有证书结论/快照不追改；封存/核验照常 =="
+api GET "/api/v1/certificates/$CC1" \
+  | python3 -c 'import sys,json;c=json.load(sys.stdin);print("W1 已签发证书 verdict =",c["verdict"],"（快照原样，不追改）")'
+SEALR=$(api POST "/api/v1/windows/$CW1/seals" "{\"certificate_id\":$CC1,\"reason\":\"微秒口径证据封存\"}")
+echo "$SEALR" | python3 -c 'import sys,json;s=json.load(sys.stdin)["seal"];print("封存:",s["status_label_zh"],"证据结论 =",s["evidence"]["verdict"])'
+SEALRID=$(echo "$SEALR" | python3 -c 'import sys,json;print(json.load(sys.stdin)["seal"]["id"])')
+api POST "/api/v1/certificates/$CC1/verification-package" > /tmp/us_bundle.json
+python3 -c 'import json,urllib.request;req=urllib.request.Request("'"$BASE_URL"'/api/v1/verification-packages/verify",data=open("/tmp/us_bundle.json","rb").read(),headers={"Content-Type":"application/json"});d=json.load(urllib.request.urlopen(req));print("核验包: 签名",d["signature_check"]["trusted"],"快照",d["snapshot_check"]["trusted"],"状态",d["certificate"]["state"])'
+api POST "/api/v1/window-seals/$SEALRID/unseal" '{"reason":"微秒用法演示完毕，解封"}' >/dev/null

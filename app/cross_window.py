@@ -21,6 +21,11 @@
 - 正常或未知（未知含采样间隔超限、边界空白与仪器故障遮蔽）**切断**累计；
 - 全程最长连续超限时长**严格大于**全程上限 -> 不合格（fail）；
 - 否则存在未知总时长 -> 待定（pending）；其余 -> 合格（pass）。
+
+所有判定均以**原始半开区段的实际时长**（快照时刻差值）为准，不先做任何
+舍入：持续 1.0004s、阈值 1.0002s 必须判不合格；不足 0.0005s 的正时长未知
+区段（旧的毫秒舍入会将其呈现为 0）也必须判待定。舍入到微秒（6 位小数）
+仅用于输出呈现，不合格优先于待定。
 """
 from __future__ import annotations
 
@@ -29,7 +34,7 @@ from typing import Any, Sequence
 from .evaluation import Segment, _merge_adjacent
 from .models import VERDICT_LABELS_ZH, Verdict
 from .report import build_evidence_segments
-from .timeutils import parse_stored, to_iso
+from .timeutils import parse_stored, round_duration, to_iso
 
 
 class CrossWindowError(ValueError):
@@ -155,6 +160,8 @@ def build_cross_window_review(
 
         win_unknown = 0.0
         for seg in segs:
+            # 时长一律取原始半开区段实际值：判定（超限累计、未知存在）
+            # 不做任何舍入；微秒舍入只用于 duration_seconds 输出。
             dur = seg.duration()
             if seg.status == "exceeded":
                 current_exceeded += dur
@@ -172,7 +179,7 @@ def build_cross_window_review(
                 "start": to_iso(seg.start),
                 "end": to_iso(seg.end),
                 "status": seg.status,
-                "duration_seconds": round(dur, 3),
+                "duration_seconds": round_duration(dur),
                 "source": {
                     "certificate_id": cert["id"],
                     "window_id": cert["window_id"],
@@ -196,7 +203,7 @@ def build_cross_window_review(
             "allowed_temp_max": item["temp_max"],
             "rule_revision": int(win.get("rule_revision", 1)),
             "segment_count": len(segs),
-            "unknown_seconds": round(win_unknown, 3),
+            "unknown_seconds": round_duration(win_unknown),
             "max_continuous_exceeded_seconds": (
                 float(snap_eval["max_continuous_exceeded_seconds"])
                 if "max_continuous_exceeded_seconds" in snap_eval else None
@@ -204,16 +211,24 @@ def build_cross_window_review(
         })
 
     total_seconds = (timeline_end - timeline_start).total_seconds()
-    max_continuous = round(longest_exceeded, 3)
-    unknown_total = round(unknown_seconds, 3)
 
-    # ---- 5) 结论：严格超限不合格；否则有未知待定；其余合格 ----
-    if max_continuous > limit:
+    # ---- 5) 结论：严格超限不合格；否则有任意正时长未知待定；其余合格 ----
+    # 判定全部使用原始累计值，不先舍入：微秒级超限（1.0004s > 1.0002s）
+    # 与亚毫秒正时长未知区段都必须如实影响结论；输出值才舍入到微秒。
+    has_unknown = unknown_seconds > 0
+    if longest_exceeded > limit:
         verdict_value = Verdict.FAIL.value
-    elif unknown_total > 0:
+    elif has_unknown:
         verdict_value = Verdict.PENDING.value
     else:
         verdict_value = Verdict.PASS.value
+
+    # 输出用微秒精度呈现（不回用于判定）
+    max_continuous = round_duration(longest_exceeded)
+    unknown_total = round_duration(unknown_seconds)
+    normal_total = round_duration(normal_seconds)
+    exceeded_total = round_duration(exceeded_seconds)
+    total_out = round_duration(total_seconds)
 
     verdict_zh = VERDICT_LABELS_ZH[verdict_value]
     span = f"[{to_iso(timeline_start)}, {to_iso(timeline_end)})"
@@ -222,14 +237,16 @@ def build_cross_window_review(
             f"复核结论：不合格（fail）。复核区间 {span}，共 {len(parsed)} 张当前可用证书、"
             f"{len(segments_out)} 个半开区段；全程最长连续超限 {max_continuous:g}s 严格超过"
             f"全程上限 {limit:g}s（跨窗边界两侧均超限连续累计，正常/未知（含故障遮蔽）"
-            f"切断累计）；未知总时长 {unknown_total:g}s。"
+            f"切断累计；按原始半开区段实际时长判定，未做毫秒舍入）；"
+            f"未知总时长 {unknown_total:g}s（不合格优先，未知不改变本结论）。"
         )
     elif verdict_value == Verdict.PENDING.value:
         conclusion = (
             f"复核结论：待定（pending）。复核区间 {span}，共 {len(parsed)} 张当前可用证书、"
             f"{len(segments_out)} 个半开区段；全程最长连续超限 {max_continuous:g}s 未超过"
             f"全程上限 {limit:g}s，但存在未知区段，未知总时长 {unknown_total:g}s"
-            "（未知含采样间隔超限、边界空白与仪器故障遮蔽，故障边界切断连续超限）。"
+            "（任意正时长未知区段均判待定，含采样间隔超限、边界空白与仪器故障遮蔽，"
+            "故障边界切断连续超限；按原始半开区段实际时长判定，未做毫秒舍入）。"
         )
     else:
         conclusion = (
@@ -243,15 +260,15 @@ def build_cross_window_review(
         "max_continuous_exceed_seconds": limit,
         "timeline_start": to_iso(timeline_start),
         "timeline_end": to_iso(timeline_end),
-        "total_seconds": round(total_seconds, 3),
+        "total_seconds": total_out,
         "segments": segments_out,
         "segment_count": len(segments_out),
         "sources": sources_out,
         "max_continuous_exceeded_seconds": max_continuous,
-        "normal_seconds": round(normal_seconds, 3),
-        "exceeded_seconds": round(exceeded_seconds, 3),
+        "normal_seconds": normal_total,
+        "exceeded_seconds": exceeded_total,
         "unknown_seconds": unknown_total,
-        "has_unknown": unknown_total > 0,
+        "has_unknown": has_unknown,
         "verdict": verdict_value,
         "verdict_label_zh": verdict_zh,
         "conclusion_zh": conclusion,

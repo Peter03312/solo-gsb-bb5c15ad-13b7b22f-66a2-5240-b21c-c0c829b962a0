@@ -37,7 +37,7 @@ from .schemas import (
     WindowSealSubmit,
     WindowUnsealSubmit,
 )
-from .timeutils import parse_stored, to_iso, to_utc
+from .timeutils import parse_stored, round_duration, to_iso, to_utc
 
 # 规则四项值（固定键顺序），供规则修订、版本化与报告复用
 RULE_FIELDS = (
@@ -762,7 +762,7 @@ def fault_period_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "fault_id": row["fault_id"],
         "start_at": row["start_at"],
         "end_at": row["end_at"],
-        "duration_seconds": round(duration, 3),
+        "duration_seconds": round_duration(duration),
         "reason": row["reason"],
         "status": row["status"],
         "created_at": row["created_at"],
