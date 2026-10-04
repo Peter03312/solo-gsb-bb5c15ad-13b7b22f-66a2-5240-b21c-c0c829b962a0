@@ -230,3 +230,125 @@ def test_segments_sum_to_total_duration():
     assert total == res["total_seconds"] == 1800.0
     assert (res["normal_seconds"] + res["exceeded_seconds"]
             + res["unknown_seconds"]) == 1800.0
+
+
+# ------------------------------------------------------------ 微秒级采样时刻
+
+def iso_us(microseconds: int) -> str:
+    return (T0 + timedelta(microseconds=microseconds)).isoformat().replace("+00:00", "Z")
+
+
+def make_cert_us(cid, start_us, end_us, readings, *, window_id=None,
+                 max_exceed=300.0, max_gap=600.0):
+    """与 make_cert 同构，但窗口/读数时刻按微秒偏移构造。"""
+    ws = T0 + timedelta(microseconds=start_us)
+    we = T0 + timedelta(microseconds=end_us)
+    parsed = [(parse_stored(r["measured_at"]), r["temperature"]) for r in readings]
+    ev = evaluate(ws, we, TMIN, TMAX, max_exceed, max_gap, parsed)
+    snap = {
+        "window": {
+            "id": window_id or cid,
+            "name": f"case-{cid}",
+            "start_at": iso_us(start_us),
+            "end_at": iso_us(end_us),
+            "allowed_temp_min": TMIN,
+            "allowed_temp_max": TMAX,
+            "max_continuous_exceed_seconds": max_exceed,
+            "max_sample_interval_seconds": max_gap,
+            "rule_revision": 1,
+        },
+        "evaluation": ev,
+        "readings": list(readings),
+    }
+    return {
+        "id": cid, "window_id": window_id or cid, "version": 1,
+        "verdict": ev["verdict"], "verdict_label_zh": "合格",
+        "issued_at": iso_us(0), "note": None,
+        "revoked": False, "revocation": None, "snapshot": snap,
+    }
+
+
+def rd_us(rid, microseconds, temp):
+    return {"reading_id": rid, "revision": 1, "measured_at": iso_us(microseconds),
+            "temperature": temp, "status": "active", "created_at": iso_us(0)}
+
+
+def test_microsecond_exceed_strictly_over_limit_fail():
+    # 持续 1.0004s 超限，全程上限 1.0002s：按实际时长严格超过 -> 不合格
+    # （旧实现先舍入到毫秒得 1.000s，会误判为未超限）
+    c1 = make_cert_us(1, 0, 2_000_000,
+                      [rd_us("a", 0, 24.0), rd_us("b", 1_000_400, 20.0),
+                       rd_us("c", 2_000_000, 20.0)])
+    c2 = make_cert_us(2, 2_000_000, 4_000_000,
+                      [rd_us("d", 2_000_000, 20.0), rd_us("e", 4_000_000, 20.0)],
+                      window_id=2)
+    res = build_cross_window_review([c1, c2], 1.0002)
+    assert res["verdict"] == "fail"
+    assert res["max_continuous_exceeded_seconds"] == 1.0004
+    assert res["exceeded_seconds"] == 1.0004
+    exc = [s for s in res["segments"] if s["status"] == "exceeded"]
+    assert len(exc) == 1 and exc[0]["duration_seconds"] == 1.0004
+
+
+def test_microsecond_exceed_exactly_at_limit_not_fail():
+    # 恰好 1.0002s == 全程上限：不严格超过，且无未知 -> 合格
+    c1 = make_cert_us(1, 0, 2_000_000,
+                      [rd_us("a", 0, 24.0), rd_us("b", 1_000_200, 20.0),
+                       rd_us("c", 2_000_000, 20.0)])
+    c2 = make_cert_us(2, 2_000_000, 4_000_000,
+                      [rd_us("d", 2_000_000, 20.0), rd_us("e", 4_000_000, 20.0)],
+                      window_id=2)
+    res = build_cross_window_review([c1, c2], 1.0002)
+    assert res["verdict"] == "pass"
+    assert res["max_continuous_exceeded_seconds"] == 1.0002
+
+
+def test_microsecond_accumulates_across_boundary():
+    # 跨窗边界两侧各 0.5002s 超限，连续累计 1.0004s > 上限 1.0002s -> 不合格
+    c1 = make_cert_us(1, 0, 2_000_000,
+                      [rd_us("a", 0, 20.0), rd_us("b", 1_499_800, 24.0),
+                       rd_us("c", 2_000_000, 20.0)])
+    c2 = make_cert_us(2, 2_000_000, 4_000_000,
+                      [rd_us("d", 2_000_000, 24.0), rd_us("e", 2_500_200, 20.0),
+                       rd_us("f", 4_000_000, 20.0)], window_id=2)
+    res = build_cross_window_review([c1, c2], 1.0002)
+    assert res["verdict"] == "fail"
+    assert res["max_continuous_exceeded_seconds"] == 1.0004
+    # 各单窗 0.5002s 均未达自身限值 -> 单窗结论合格（不跨证合并区段）
+    assert [s["max_continuous_exceeded_seconds"] for s in res["sources"]] == [0.5002, 0.5002]
+
+
+def test_microsecond_tiny_unknown_is_pending_not_zero():
+    # 0.0004s 边界空白未知（不足 0.0005s）：任意正时长未知 -> 待定，
+    # 不再被舍入为零而误判合格
+    c1 = make_cert_us(1, 0, 2_000_000,
+                      [rd_us("a", 0, 20.0), rd_us("b", 2_000_000, 20.0)])
+    c2 = make_cert_us(2, 2_000_000, 4_000_000,
+                      [rd_us("d", 2_000_400, 20.0), rd_us("e", 4_000_000, 20.0)],
+                      window_id=2)
+    res = build_cross_window_review([c1, c2], 1.0002)
+    assert res["verdict"] == "pending"
+    assert res["unknown_seconds"] == 0.0004
+    assert res["has_unknown"] is True
+    unk = [s for s in res["segments"] if s["status"] == "unknown"]
+    assert len(unk) == 1 and unk[0]["duration_seconds"] == 0.0004
+    assert unk[0]["source"]["certificate_id"] == 2
+    assert res["sources"][1]["unknown_seconds"] == 0.0004
+    # 区段时长合计仍守恒（微秒精度）
+    total = sum(s["duration_seconds"] for s in res["segments"])
+    assert total == res["total_seconds"] == 4.0
+
+
+def test_microsecond_tiny_unknown_does_not_save_from_fail():
+    # 已有超限不合格时仍以不合格优先（微秒未知不改变优先级）
+    c1 = make_cert_us(1, 0, 2_000_000,
+                      [rd_us("a", 0, 24.0), rd_us("b", 1_000_400, 20.0),
+                       rd_us("c", 2_000_000, 20.0)])
+    c2 = make_cert_us(2, 2_000_000, 4_000_000,
+                      [rd_us("d", 2_000_400, 20.0), rd_us("e", 4_000_000, 20.0)],
+                      window_id=2)
+    res = build_cross_window_review([c1, c2], 1.0002)
+    assert res["verdict"] == "fail"
+    assert res["max_continuous_exceeded_seconds"] == 1.0004
+    assert res["unknown_seconds"] == 0.0004
+    assert res["has_unknown"] is True

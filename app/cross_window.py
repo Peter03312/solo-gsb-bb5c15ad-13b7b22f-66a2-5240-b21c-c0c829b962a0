@@ -21,12 +21,16 @@
 - 正常或未知（未知含采样间隔超限、边界空白与仪器故障遮蔽）**切断**累计；
 - 全程最长连续超限时长**严格大于**全程上限 -> 不合格（fail）；
 - 否则存在未知总时长 -> 待定（pending）；其余 -> 合格（pass）。
+
+时长精度：与单窗审定同一口径——按原始半开区段的实际时长（微秒精度）
+累计与判定，不再先舍入到毫秒：持续 1.0004s 对上限 1.0002s 判不合格；
+不足 0.0005s 的未知时段不再被舍入为零，任意正时长未知即判待定。
 """
 from __future__ import annotations
 
 from typing import Any, Sequence
 
-from .evaluation import Segment, _merge_adjacent
+from .evaluation import Segment, _merge_adjacent, round_duration
 from .models import VERDICT_LABELS_ZH, Verdict
 from .report import build_evidence_segments
 from .timeutils import parse_stored, to_iso
@@ -172,7 +176,7 @@ def build_cross_window_review(
                 "start": to_iso(seg.start),
                 "end": to_iso(seg.end),
                 "status": seg.status,
-                "duration_seconds": round(dur, 3),
+                "duration_seconds": round_duration(dur),
                 "source": {
                     "certificate_id": cert["id"],
                     "window_id": cert["window_id"],
@@ -196,7 +200,7 @@ def build_cross_window_review(
             "allowed_temp_max": item["temp_max"],
             "rule_revision": int(win.get("rule_revision", 1)),
             "segment_count": len(segs),
-            "unknown_seconds": round(win_unknown, 3),
+            "unknown_seconds": round_duration(win_unknown),
             "max_continuous_exceeded_seconds": (
                 float(snap_eval["max_continuous_exceeded_seconds"])
                 if "max_continuous_exceeded_seconds" in snap_eval else None
@@ -204,8 +208,11 @@ def build_cross_window_review(
         })
 
     total_seconds = (timeline_end - timeline_start).total_seconds()
-    max_continuous = round(longest_exceeded, 3)
-    unknown_total = round(unknown_seconds, 3)
+    # 按原始半开区段的实际时长（微秒精度）判定：不再先舍入到毫秒——
+    # 持续 1.0004s 对上限 1.0002s 属于严格超过；不足 0.0005s 的未知
+    # 时段不再被舍入为零，任意正时长未知即判待定。
+    max_continuous = round_duration(longest_exceeded)
+    unknown_total = round_duration(unknown_seconds)
 
     # ---- 5) 结论：严格超限不合格；否则有未知待定；其余合格 ----
     if max_continuous > limit:
@@ -243,13 +250,13 @@ def build_cross_window_review(
         "max_continuous_exceed_seconds": limit,
         "timeline_start": to_iso(timeline_start),
         "timeline_end": to_iso(timeline_end),
-        "total_seconds": round(total_seconds, 3),
+        "total_seconds": round_duration(total_seconds),
         "segments": segments_out,
         "segment_count": len(segments_out),
         "sources": sources_out,
         "max_continuous_exceeded_seconds": max_continuous,
-        "normal_seconds": round(normal_seconds, 3),
-        "exceeded_seconds": round(exceeded_seconds, 3),
+        "normal_seconds": round_duration(normal_seconds),
+        "exceeded_seconds": round_duration(exceeded_seconds),
         "unknown_seconds": unknown_total,
         "has_unknown": unknown_total > 0,
         "verdict": verdict_value,

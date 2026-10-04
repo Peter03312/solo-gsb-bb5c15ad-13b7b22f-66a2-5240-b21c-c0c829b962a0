@@ -8,7 +8,7 @@ from typing import Any, Optional
 from fastapi import HTTPException, status
 
 from . import attestation
-from .evaluation import evaluate
+from .evaluation import evaluate, round_duration
 from .cross_window import CrossWindowError, build_cross_window_review
 from .models import (
     FAULT_ACTIVE,
@@ -762,7 +762,8 @@ def fault_period_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "fault_id": row["fault_id"],
         "start_at": row["start_at"],
         "end_at": row["end_at"],
-        "duration_seconds": round(duration, 3),
+        # 微秒精度：与审定区段同一口径，呈现微秒级时长差异
+        "duration_seconds": round_duration(duration),
         "reason": row["reason"],
         "status": row["status"],
         "created_at": row["created_at"],

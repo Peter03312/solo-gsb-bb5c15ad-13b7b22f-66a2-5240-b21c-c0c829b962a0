@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional, Sequence
 
-from .evaluation import Interval, union_intervals
+from .evaluation import Interval, round_duration, union_intervals
 from .models import UNKNOWN_INSTRUMENT_FAULT, VERDICT_LABELS_ZH
 from .timeutils import parse_stored, to_iso
 
@@ -330,7 +330,8 @@ def _timeline_change(seg: EvidenceSeg, start: datetime, end: datetime,
     return {
         "start": to_iso(start),
         "end": to_iso(end),
-        "duration_seconds": round((end - start).total_seconds(), 3),
+        # 微秒精度：与审定/跨窗复核同一口径，呈现影响结论的微秒差异
+        "duration_seconds": round_duration((end - start).total_seconds()),
         "before": {"status": old.status, "evidence": old.evidence()},
         "after": {"status": new.status, "evidence": new.evidence()},
     }
@@ -359,7 +360,7 @@ def merge_adjacent_changes(changes: Sequence[dict[str, Any]]) -> list[dict[str, 
                 merged[-1] = {
                     "start": prev["start"],
                     "end": ch["end"],
-                    "duration_seconds": round((end_dt - start_dt).total_seconds(), 3),
+                    "duration_seconds": round_duration((end_dt - start_dt).total_seconds()),
                     "before": prev["before"],
                     "after": prev["after"],
                 }
@@ -523,7 +524,9 @@ def diff_rules(old_snap: dict[str, Any], new_snap: dict[str, Any]) -> dict[str, 
                 "label_zh": RULE_LABELS_ZH[f],
                 "before": old_v,
                 "after": new_v,
-                "delta": round(new_v - old_v, 3),
+                # 微秒精度：时长类规则（如最长连续超限 1.0002s -> 1.0004s）
+                # 的微秒级变化也要在增量中可见
+                "delta": round(new_v - old_v, 6),
                 "unit_zh": RULE_UNITS_ZH[f],
             })
 
@@ -561,7 +564,7 @@ def _build_summary(old_cert: dict[str, Any], new_cert: dict[str, Any],
     old_max = float(old_ev["max_continuous_exceeded_seconds"])
     new_max = float(new_ev["max_continuous_exceeded_seconds"])
     limit = float(new_ev["max_exceed_seconds"])
-    delta = round(new_max - old_max, 3)
+    delta = round_duration(new_max - old_max)
     if delta > 0:
         delta_text = f"增加 {delta:g}s"
     elif delta < 0:

@@ -17,6 +17,12 @@
 - 最长连续超限时长“超过”限值 -> 不合格（fail）；刚好等于限值不算超过。
 - 否则只要存在未知区段 -> 待定（pending）。
 - 其余 -> 合格（pass）。
+
+时长精度：采样时刻可带微秒，半开区段的实际时长是微秒（1e-6 秒）的整数倍。
+判定与输出一律按原始半开区段的实际时长（微秒精度，保留 6 位小数），
+不再先舍入到毫秒——毫秒舍入会吞掉影响结论的微秒差异（持续 1.0004s 对
+阈值 1.0002s 会被误判为未超限；不足 0.0005s 的未知区段会被舍入为零而
+漏判待定）。
 """
 from __future__ import annotations
 
@@ -26,6 +32,19 @@ from typing import Any, Iterable, Sequence
 
 from .models import Verdict
 from .timeutils import to_iso
+
+# 时长精度：采样时刻为微秒级，区段实际时长是微秒（1e-6 秒）的整数倍；
+# 判定与输出统一保留 6 位小数（微秒），不做毫秒舍入。
+DURATION_PLACES = 6
+
+
+def round_duration(seconds: float) -> float:
+    """把时长（秒）规范化到微秒精度。
+
+    采样时刻带微秒，半开区段的实际时长是 1e-6 秒的整数倍；round 到 6 位
+    小数即还原该精确值（同时消除浮点累计尾差），供判定与输出统一使用。
+    """
+    return round(seconds, DURATION_PLACES)
 
 
 @dataclass(frozen=True)
@@ -88,7 +107,7 @@ class Segment:
             "start": to_iso(self.start),
             "end": to_iso(self.end),
             "status": self.status,
-            "duration_seconds": round(self.duration(), 3),
+            "duration_seconds": round_duration(self.duration()),
         }
 
 
@@ -193,7 +212,11 @@ def _merge_adjacent(segments: Iterable[Segment]) -> list[Segment]:
 
 
 def _max_continuous_exceeded(segments: Sequence[Segment]) -> float:
-    """最长连续超限时长：相邻 exceeded 区段时长之和，被其它状态打断则重新累计。"""
+    """最长连续超限时长：相邻 exceeded 区段时长之和，被其它状态打断则重新累计。
+
+    按原始半开区段的实际时长累计（微秒级），不做毫秒舍入；返回值由调用方
+    经 round_duration 规范化到微秒后再参与阈值比较与输出。
+    """
     longest = 0.0
     current = 0.0
     for seg in segments:
@@ -247,8 +270,11 @@ def evaluate(
     exceeded = [s for s in segments if s.status == "exceeded"]
     unknown = [s for s in segments if s.status == "unknown"]
 
-    max_continuous = round(_max_continuous_exceeded(segments), 3)
+    # 按原始半开区段的实际时长判定（微秒精度）：不再先舍入到毫秒再与阈值
+    # 比较——持续 1.0004s 对阈值 1.0002s 属于严格超过，应判不合格。
+    max_continuous = round_duration(_max_continuous_exceeded(segments))
     has_exceeded = bool(exceeded)
+    # 任意正时长未知区段均须判待定（合并后零时长区段已被剔除）
     has_unknown = bool(unknown)
 
     # “超过”才不合格：严格大于
@@ -275,7 +301,7 @@ def evaluate(
             {
                 "start": to_iso(f.start),
                 "end": to_iso(f.end),
-                "duration_seconds": round(f.duration(), 3),
+                "duration_seconds": round_duration(f.duration()),
             }
             for f in fault_union
         ],

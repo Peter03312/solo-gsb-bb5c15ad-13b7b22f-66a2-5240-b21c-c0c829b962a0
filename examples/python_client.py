@@ -51,6 +51,10 @@
      凭封存编号与非空原因解封（同因幂等、异因冲突）后可按原流程更正，
      已解封窗口可再次封存形成新记录；封存证书被撤销后查询显示其已非当前
      可用，但封存证据不变。
+ 13) 微秒级采样时刻：单窗审定与跨窗复核按原始半开区段实际时长（微秒精度）
+     判定，不做毫秒舍入——超限持续 1.0004s 对阈值 1.0002s 判不合格、
+     恰好等于阈值不判不合格、0.0004s 未知区段判待定；输出时长呈现微秒
+     差异；签发/封存/核验包流程在微秒数据下照常。
 """
 from __future__ import annotations
 
@@ -1069,6 +1073,101 @@ def seal_demo() -> None:
     print("窗口/证书不存在 404、证书他窗 422、空白原因 422，不符拒绝均不留新记录")
 
 
+# ------------------------------------------------------------ 微秒级采样时刻
+
+def microsecond_demo() -> None:
+    """微秒级采样时刻：单窗审定与跨窗复核按原始半开区段实际时长判定。
+
+    - 超限持续 1.0004s 对阈值 1.0002s -> 不合格（旧口径先舍入到毫秒会误判）；
+    - 恰好等于阈值不算超过；任意正时长未知区段（0.0004s）-> 待定；
+    - 跨窗复核同一微秒口径；签发/封存/核验包流程在微秒数据下照常。
+    """
+    show("微秒级采样时刻：按实际时长（微秒精度）判定，不做毫秒舍入")
+
+    def make_us_window(name, start, end, max_exceed):
+        _, w = call("POST", "/api/v1/windows", {
+            "name": name, "start_at": start, "end_at": end,
+            "allowed_temp_min": 18.0, "allowed_temp_max": 22.0,
+            "max_continuous_exceed_seconds": max_exceed,
+            "max_sample_interval_seconds": 10.0,
+        })
+        return w["id"]
+
+    def submit_us(wid, rid, measured_at, temp):
+        return call("POST", f"/api/v1/windows/{wid}/readings",
+                    {"reading_id": rid, "revision": 1,
+                     "measured_at": measured_at, "temperature": temp})
+
+    # 两个首尾相接的微秒窗口：[00:00:00,00:00:02) 与 [00:00:02,00:00:04)
+    w1 = make_us_window("微秒窗-1", "2026-10-01T00:00:00Z",
+                        "2026-10-01T00:00:02Z", 1.0002)
+    w2 = make_us_window("微秒窗-2", "2026-10-01T00:00:02Z",
+                        "2026-10-01T00:00:04Z", 1.0002)
+
+    # 窗 1：00:00:00 超限 23°C，00:00:01.000400 回落 -> 超限持续 1.0004s
+    assert submit_us(w1, "a", "2026-10-01T00:00:00Z", 23.0)[0] == 201
+    assert submit_us(w1, "b", "2026-10-01T00:00:01.000400Z", 20.0)[0] == 201
+    assert submit_us(w1, "c", "2026-10-01T00:00:02Z", 20.0)[0] == 201
+    code, ev = call("GET", f"/api/v1/windows/{w1}/evaluation")
+    assert code == 200 and ev["verdict"] == "fail"
+    assert ev["max_continuous_exceeded_seconds"] == 1.0004
+    assert ev["exceeded_segments"][0]["duration_seconds"] == 1.0004
+    assert ev["exceeded_segments"][0]["end"] == "2026-10-01T00:00:01.000400Z"
+    print("单窗审定: 超限持续 1.0004s 严格超过阈值 1.0002s ->",
+          ev["verdict"], "（输出时长呈现微秒差异）")
+
+    # 恰好等于阈值不算超过：阈值修订为 1.0004s 后同一读数序列 -> pass
+    code, d = revise_rules(w1, 2, max_exceed=1.0004, max_gap=10.0,
+                           reason="阈值调整为 1.0004s（恰好等于持续时长）")
+    assert code == 201 and d["effect"] == "revised"
+    assert d["current_evaluation"]["verdict"] == "pass"
+    assert d["current_evaluation"]["max_continuous_exceeded_seconds"] == 1.0004
+    print("恰好等于阈值（1.0004s == 1.0004s）不判不合格 ->",
+          d["current_evaluation"]["verdict"])
+
+    # 窗 2：首读在起点后 0.0004s -> 边界空白未知 0.0004s（不足 0.0005s）-> 待定
+    assert submit_us(w2, "d", "2026-10-01T00:00:02.000400Z", 20.0)[0] == 201
+    assert submit_us(w2, "e", "2026-10-01T00:00:04Z", 20.0)[0] == 201
+    _, ev2 = call("GET", f"/api/v1/windows/{w2}/evaluation")
+    assert ev2["verdict"] == "pending"
+    assert ev2["unknown_segments"][0]["duration_seconds"] == 0.0004
+    print("0.0004s 边界空白未知（不足 0.0005s 不舍入为零）->",
+          ev2["verdict"], "未知时长", ev2["unknown_segments"][0]["duration_seconds"], "s")
+
+    # 各窗签发后跨窗复核：上限 1.0002s -> 超限 1.0004s 严格超过 -> fail
+    c1 = call("POST", f"/api/v1/windows/{w1}/certificates/issue",
+              {"note": "微秒窗1"})[1]
+    c2 = call("POST", f"/api/v1/windows/{w2}/certificates/issue",
+              {"note": "微秒窗2"})[1]
+    assert c1["snapshot"]["evaluation"]["max_continuous_exceeded_seconds"] == 1.0004
+    code, d = cross_window_review([c1["id"], c2["id"]], 1.0002)
+    assert code == 201 and d["verdict"] == "fail"
+    assert d["max_continuous_exceeded_seconds"] == 1.0004
+    assert d["unknown_seconds"] == 0.0004 and d["has_unknown"] is True
+    print("跨窗复核(上限 1.0002s):", d["verdict"],
+          "最长连续超限", d["max_continuous_exceeded_seconds"],
+          "s（未知不掩盖不合格）")
+
+    # 上限恰好 1.0004s：不严格超过，但有 0.0004s 未知 -> pending
+    code, d = cross_window_review([c1["id"], c2["id"]], 1.0004)
+    assert code == 201 and d["verdict"] == "pending"
+    print("跨窗复核(上限 1.0004s):", d["verdict"], "（等于不算超过；微秒未知 -> 待定）")
+
+    # 微秒数据下封存与核验照常：封存证据固化微秒结果，解封恢复
+    code, s = seal_window(w1, c1["id"], "微秒窗口封存")
+    assert code == 201 and s["seal"]["status"] == "sealed"
+    assert s["seal"]["evidence"]["snapshot"]["evaluation"][
+        "max_continuous_exceeded_seconds"] == 1.0004
+    code, pkg = verification_package(c1["id"])
+    assert code == 201
+    code, v = verify_package(pkg)
+    assert code == 200 and v["package_trusted"] is True
+    assert v["certificate"]["state"] == "current"
+    code, u = unseal_window(s["seal"]["id"], "演示结束解封")
+    assert code == 201 and u["effect"] == "unsealed"
+    print("微秒数据下签发/封存/核验包/解封流程照常（证据固化微秒精度结果）")
+
+
 if __name__ == "__main__":
     main()
     fault_period_demo()
@@ -1076,4 +1175,5 @@ if __name__ == "__main__":
     cross_window_demo()
     verification_package_demo()
     seal_demo()
+    microsecond_demo()
     print("\n全部示例执行完成 ✔")

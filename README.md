@@ -2,7 +2,10 @@
 
 对博物馆展柜在指定**审定窗口**内采集到的温度读数进行暴露审定：按时间排序后，
 以“每条读数只覆盖到下一条读数”的采样保持语义切分区段，识别 **正常 / 超限 / 未知**
-区段，计算**最长连续超限时长**，并给出审定结论；支持读数幂等提交、修订替换、
+区段，计算**最长连续超限时长**，并给出审定结论；采样时刻支持**微秒**——
+单窗审定与跨窗复核按原始半开区段的**实际时长**（微秒精度）判定，
+不做毫秒舍入（持续 1.0004s 对阈值 1.0002s 判不合格，任意正时长未知区段
+即判待定），输出时长呈现影响结论的微秒差异；支持读数幂等提交、修订替换、
 **采样仪器按审定窗口批量补传（整批事务、互换时刻、重放不产生新修订）**、
 **误采作废与恢复（作废留存修订：原因/操作时间/前一版本；更高修订号恢复）**、
 **仪器失准故障时段登记与撤回**（馆员确认仪器失准时按窗口登记带标识、
@@ -84,6 +87,16 @@
 
 “最长连续超限”指相邻的超限区段时长之和，被正常/未知区段打断后重新累计。
 即使存在未知区段，只要超限超时，结论仍为不合格。
+
+> **时长精度（微秒）**：采样时刻可带微秒（如
+> `2026-10-01T00:00:01.000400Z`）。单窗审定与跨窗复核一律按原始半开区段
+> 的**实际时长**（微秒精度，保留 6 位小数）判定与输出，**不再先舍入到
+> 毫秒**：最长连续超限 1.0004s 对阈值 1.0002s 属于严格超过，判**不合格**；
+> 恰好等于阈值（如 1.0002s）不算超过。任意**正时长**未知区段——哪怕只有
+> 0.0004s（不足 0.0005s）——都使结论为**待定**（已有超限不合格时仍以
+> 不合格优先）。输出中的 `duration_seconds`、
+> `max_continuous_exceeded_seconds`、`unknown_seconds` 等时长字段均呈现
+> 影响结论的微秒差异。
 
 ### 读数提交、幂等与修订
 
@@ -391,7 +404,9 @@
 - **跨窗累计口径**：各窗区段首尾相接后顺序遍历——
   - **跨窗边界两侧均超限**时连续累计（半开窗在边界处首尾相接、互不重叠）；
   - **正常或未知切断累计**（未知含采样间隔超限、边界空白与**仪器故障遮蔽**，
-    即故障边界同样切断跨窗连续超限），切断后重新累计。
+    即故障边界同样切断跨窗连续超限），切断后重新累计；
+  - 时长按原始半开区段的**实际时长**（微秒精度）累计与判定，与单窗审定
+    同一口径：不做毫秒舍入，不足 0.0005s 的未知时段也计入未知总时长。
 - **输出**：
   - `segments`：逐段半开区间 `start`/`end`/`status`/`duration_seconds`
     与 `source`（还原该段的 `certificate_id`/`window_id`/`version`）；
@@ -407,7 +422,8 @@
   - `verdict` 与中文结论 `conclusion_zh`。
 - **结论判定（按优先级）**：全程最长连续超限时长**严格大于**全程上限 →
   **不合格**（即使存在未知仍判不合格）；否则只要存在未知总时长 → **待定**；
-  其余 → **合格**。恰好等于上限不算超过。
+  其余 → **合格**。恰好等于上限不算超过。判定与输出时长均为微秒精度：
+  1.0004s 对上限 1.0002s 判不合格；0.0004s 的未知时段即判待定。
 - **只读与一致性**：复核为只读操作，在同一显式读事务内取**同一已提交状态**
   完成全部核对，**不修改证书、读数、规则、故障登记或移交单**（HTTP 用
   `201` 仅表示“出具了一份复核结果”，不落任何记录，故无复核单号、可重复调用）。
@@ -1061,10 +1077,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 服务启动后：
 
 ```bash
-# curl 全流程（创建窗口 → 提交/幂等/冲突/修订 → 审定 → 两次签发 → 修订影响报告 → 批量补传 → 误采作废与恢复 → 规则版本化修订与跨规则版本报告 → 仪器失准故障时段登记/撤回与跨证报告 → 已签发证书撤销 → 展柜移交放行单 → 跨审定窗口连续温度暴露复核 → 证书核验包出具/核验与本地签名密钥轮换 → 窗口封存/解封与封存期只读）
+# curl 全流程（创建窗口 → 提交/幂等/冲突/修订 → 审定 → 两次签发 → 修订影响报告 → 批量补传 → 误采作废与恢复 → 规则版本化修订与跨规则版本报告 → 仪器失准故障时段登记/撤回与跨证报告 → 已签发证书撤销 → 展柜移交放行单 → 跨审定窗口连续温度暴露复核 → 证书核验包出具/核验与本地签名密钥轮换 → 窗口封存/解封与封存期只读 → 微秒级采样时刻审定与跨窗复核）
 bash examples/curl-examples.sh
 
-# Python 全流程（仅标准库，演示三种结论、拒收、修订、版本快照、修订影响报告、批量补传、误采作废与恢复、规则版本化修订与跨规则版本报告、仪器失准故障时段登记/撤回与故障遮蔽跨证报告、已签发证书撤销与当前可用证书、展柜移交放行单、跨审定窗口连续温度暴露复核、证书核验包出具/核验（含已撤销/被替代）与本地签名密钥轮换、窗口封存/解封：同写事务快照一致性核对、封存期写操作拒绝与查询/撤销可用、幂等/冲突、解封更正与再次封存、封存证据在证书撤销后不变）
+# Python 全流程（仅标准库，演示三种结论、拒收、修订、版本快照、修订影响报告、批量补传、误采作废与恢复、规则版本化修订与跨规则版本报告、仪器失准故障时段登记/撤回与故障遮蔽跨证报告、已签发证书撤销与当前可用证书、展柜移交放行单、跨审定窗口连续温度暴露复核、证书核验包出具/核验（含已撤销/被替代）与本地签名密钥轮换、窗口封存/解封：同写事务快照一致性核对、封存期写操作拒绝与查询/撤销可用、幂等/冲突、解封更正与再次封存、封存证据在证书撤销后不变，以及微秒级采样时刻：单窗按实际时长判定、微秒未知待定、跨窗复核同一口径、签发/封存/核验照常）
 python3 examples/python_client.py
 # 或指定地址：
 BASE_URL=http://127.0.0.1:8000 python3 examples/python_client.py
@@ -1251,6 +1267,76 @@ curl -sS -X POST http://localhost:8000/api/v1/cross-window-reviews \
 # 复核只读：不改证书/读数/规则/故障登记/移交单，可随时凭同一组证书重复调用。
 ```
 
+微秒级采样时刻审定最小示例（本轮：按原始半开区段实际时长判定，不做毫秒舍入）：
+
+```bash
+# 1) 建窗：最长连续超限阈值 1.0002s（微秒级阈值），最大采样间隔 10s
+curl -sS http://localhost:8000/api/v1/windows \
+  -H 'Content-Type: application/json' -d '{
+    "name":"微秒采样窗",
+    "start_at":"2026-10-01T00:00:00Z","end_at":"2026-10-01T00:00:02Z",
+    "allowed_temp_min":18.0,"allowed_temp_max":22.0,
+    "max_continuous_exceed_seconds":1.0002,"max_sample_interval_seconds":10}'
+
+# 2) 提交带微秒的采样时刻：00:00:00 超限 23°C，00:00:01.000400 回落 20°C，
+#    窗口终点 00:00:02 覆盖终止采样 -> 超限持续 1.0004s
+curl -sS http://localhost:8000/api/v1/windows/1/readings \
+  -H 'Content-Type: application/json' \
+  -d '{"reading_id":"a","revision":1,"measured_at":"2026-10-01T00:00:00Z","temperature":23.0}'
+curl -sS http://localhost:8000/api/v1/windows/1/readings \
+  -H 'Content-Type: application/json' \
+  -d '{"reading_id":"b","revision":1,"measured_at":"2026-10-01T00:00:01.000400Z","temperature":20.0}'
+curl -sS http://localhost:8000/api/v1/windows/1/readings \
+  -H 'Content-Type: application/json' \
+  -d '{"reading_id":"c","revision":1,"measured_at":"2026-10-01T00:00:02Z","temperature":20.0}'
+
+# 3) 单窗审定：1.0004s 严格超过阈值 1.0002s -> fail（旧口径先舍入到毫秒
+#    得 1.000s，会误判未超限）；输出时长呈现微秒差异
+curl -sS http://localhost:8000/api/v1/windows/1/evaluation
+# -> {"verdict":"fail","max_continuous_exceeded_seconds":1.0004,
+#     "max_exceed_seconds":1.0002,
+#     "exceeded_segments":[{"start":"2026-10-01T00:00:00Z",
+#        "end":"2026-10-01T00:00:01.000400Z","status":"exceeded",
+#        "duration_seconds":1.0004}], ...}
+# 若回落读数恰在 00:00:01.000200（持续恰好 1.0002s == 阈值）-> 不判不合格。
+
+# 4) 任意正时长未知区段即待定：首读在起点后 0.0004s（不足 0.0005s）
+#    -> 边界空白未知 0.0004s，结论 pending（不再被舍入为零）
+curl -sS http://localhost:8000/api/v1/windows \
+  -H 'Content-Type: application/json' -d '{
+    "name":"微秒未知窗",
+    "start_at":"2026-10-01T00:00:02Z","end_at":"2026-10-01T00:00:04Z",
+    "allowed_temp_min":18.0,"allowed_temp_max":22.0,
+    "max_continuous_exceed_seconds":1.0002,"max_sample_interval_seconds":10}'
+curl -sS http://localhost:8000/api/v1/windows/2/readings \
+  -H 'Content-Type: application/json' \
+  -d '{"reading_id":"d","revision":1,"measured_at":"2026-10-01T00:00:02.000400Z","temperature":20.0}'
+curl -sS http://localhost:8000/api/v1/windows/2/readings \
+  -H 'Content-Type: application/json' \
+  -d '{"reading_id":"e","revision":1,"measured_at":"2026-10-01T00:00:04Z","temperature":20.0}'
+curl -sS http://localhost:8000/api/v1/windows/2/evaluation
+# -> {"verdict":"pending","unknown_segments":[{"start":"2026-10-01T00:00:02Z",
+#      "end":"2026-10-01T00:00:02.000400Z","status":"unknown",
+#      "duration_seconds":0.0004}], ...}
+
+# 5) 两窗首尾相接 [00:00:00,00:00:02)+[00:00:02,00:00:04)，温度口径一致；
+#    各窗签发后跨窗复核：同一微秒口径（上限 1.0002s）
+C1=$(curl -sS -X POST http://localhost:8000/api/v1/windows/1/certificates/issue \
+  -H 'Content-Type: application/json' -d '{"note":"微秒窗1"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+C2=$(curl -sS -X POST http://localhost:8000/api/v1/windows/2/certificates/issue \
+  -H 'Content-Type: application/json' -d '{"note":"微秒窗2"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+curl -sS -X POST http://localhost:8000/api/v1/cross-window-reviews \
+  -H 'Content-Type: application/json' \
+  -d '{"certificate_ids":['"$C1"','"$C2"'],"max_continuous_exceed_seconds":1.0002}'
+# -> {"verdict":"fail","max_continuous_exceeded_seconds":1.0004,
+#     "unknown_seconds":0.0004,"has_unknown":true, ...}
+#    （超限 1.0004s 严格超过 1.0002s -> 不合格，未知不掩盖不合格；
+#      若全程无超限，0.0004s 未知时段也使结论为待定）
+#
+# 签发、封存、核验包出具/核验等流程在微秒数据下照常工作；
+# 已签发证书的结论与不可变快照保持原样，不追改。
+```
+
 证书核验包最小示例（承接一张已签发证书 `$CID`）：
 
 ```bash
@@ -1333,7 +1419,8 @@ PYTHONPATH=. python -m pytest tests/ -q
 ```
 
 - `tests/test_evaluation.py`：审定算法纯函数测试（未知/超限/合格、
-  边界等于、时区归一、区段无缝拼接、故障时段并集/遮蔽/切断连续超限等）。
+  边界等于、时区归一、区段无缝拼接、故障时段并集/遮蔽/切断连续超限、
+  微秒级采样时刻的实际时长判定与输出）。
 - `tests/test_report.py`：修订影响报告纯函数测试（读数差异、带证据
   区段、边界对齐、未知来源、区间合并、汇总方向）。
 - `tests/test_api.py`：HTTP 集成测试（幂等、冲突、修订替换、拒收、
@@ -1379,7 +1466,8 @@ PYTHONPATH=. python -m pytest tests/ -q
 - `tests/test_cross_window.py`：跨窗连续温度暴露复核纯函数测试
   （满覆盖合格、跨窗边界两侧超限连续累计与严格大于口径、正常/采样间隔
   未知/故障遮蔽在边界切断累计、有未知待定且未知不改不合格、不足两张/
-  顺序错误/窗口缝隙或重叠/温度范围不一致拒绝、区段时长合计守恒）。
+  顺序错误/窗口缝隙或重叠/温度范围不一致拒绝、区段时长合计守恒、
+  微秒级超限判定与微秒级未知时段待定）。
 - `tests/test_cross_window_api.py`：跨窗复核 HTTP 集成测试
   （逐段状态与来源证书、跨边界累计 fail/等于上限 pass/正常切断/采样
   间隔未知/故障遮蔽未知待定/有未知仍 fail；只读不改证书且只依快照；
@@ -1403,6 +1491,11 @@ PYTHONPATH=. python -m pytest tests/ -q
   封存形成新记录且旧证据保留；封存证书撤销后查询显示已非当前可用而证据
   摘要不变；窗口/证书/封存编号 404、空原因 422；封存与写并发按提交顺序
   二选一成立）。
+- `tests/test_microsecond_api.py`：微秒级采样时刻 HTTP 集成测试
+  （单窗审定按原始半开区段实际时长判定：1.0004s 超限对阈值 1.0002s 判
+  不合格、恰好等于阈值不判不合格、0.0004s 未知区段判待定、输出时长呈现
+  微秒差异；跨窗复核同一口径且不足 0.0005s 的未知时段不舍入为零；
+  微秒数据下签发/封存/解封/核验包流程照常；缺时区等非法输入拒绝语义不变）。
 
 ## 6. 目录结构
 

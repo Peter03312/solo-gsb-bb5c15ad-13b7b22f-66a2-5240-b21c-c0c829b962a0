@@ -635,3 +635,64 @@ api POST "/api/v1/windows/99999/seals" "{\"certificate_id\":$SCID2,\"reason\":\"
 api POST "/api/v1/windows/$SIDW/seals" '{"certificate_id":99999,"reason":"证书不存在"}' || true
 api POST "/api/v1/windows/1/seals" "{\"certificate_id\":$SCID2,\"reason\":\"他窗证书\"}" || true
 api POST "/api/v1/windows/$SIDW/seals" "{\"certificate_id\":$SCID2,\"reason\":\"   \"}" || true
+
+echo "== 21. 微秒级采样时刻：按原始半开区段实际时长判定（不做毫秒舍入）=="
+# 两个首尾相接的微秒窗口：[00:00:00,00:00:02) 与 [00:00:02,00:00:04)，阈值 1.0002s
+US1=$(api POST /api/v1/windows '{
+  "name":"微秒窗-1","start_at":"2026-10-01T00:00:00Z","end_at":"2026-10-01T00:00:02Z",
+  "allowed_temp_min":18.0,"allowed_temp_max":22.0,
+  "max_continuous_exceed_seconds":1.0002,"max_sample_interval_seconds":10}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+US2=$(api POST /api/v1/windows '{
+  "name":"微秒窗-2","start_at":"2026-10-01T00:00:02Z","end_at":"2026-10-01T00:00:04Z",
+  "allowed_temp_min":18.0,"allowed_temp_max":22.0,
+  "max_continuous_exceed_seconds":1.0002,"max_sample_interval_seconds":10}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+
+echo "-- 21.1 单窗审定：超限持续 1.0004s 严格超过阈值 1.0002s -> fail（旧口径先舍入毫秒会误判）--"
+api POST "/api/v1/windows/$US1/readings" '{"reading_id":"a","revision":1,"measured_at":"2026-10-01T00:00:00Z","temperature":23.0}' >/dev/null
+api POST "/api/v1/windows/$US1/readings" '{"reading_id":"b","revision":1,"measured_at":"2026-10-01T00:00:01.000400Z","temperature":20.0}' >/dev/null
+api POST "/api/v1/windows/$US1/readings" '{"reading_id":"c","revision":1,"measured_at":"2026-10-01T00:00:02Z","temperature":20.0}' >/dev/null
+api GET "/api/v1/windows/$US1/evaluation" \
+  | python3 -c 'import sys,json;e=json.load(sys.stdin);print("verdict:",e["verdict"],"最长连续超限:",e["max_continuous_exceeded_seconds"],"s 阈值:",e["max_exceed_seconds"],"s");print("超限段:",[(s["start"],s["end"],s["duration_seconds"]) for s in e["exceeded_segments"]])'
+
+echo "-- 21.2 恰好等于阈值不算超过：规则修订阈值为 1.0004s -> pass --"
+api POST "/api/v1/windows/$US1/rule-revisions" '{
+  "revision":2,"allowed_temp_min":18.0,"allowed_temp_max":22.0,
+  "max_continuous_exceed_seconds":1.0004,"max_sample_interval_seconds":10,
+  "reason":"阈值调整为 1.0004s（恰好等于持续时长）"}' \
+  | python3 -c 'import sys,json;d=json.load(sys.stdin);print("effect:",d["effect"],"verdict:",d["current_evaluation"]["verdict"],"最长连续超限:",d["current_evaluation"]["max_continuous_exceeded_seconds"])'
+
+echo "-- 21.3 任意正时长未知区段即待定：首读在起点后 0.0004s（不足 0.0005s 不舍入为零）--"
+api POST "/api/v1/windows/$US2/readings" '{"reading_id":"d","revision":1,"measured_at":"2026-10-01T00:00:02.000400Z","temperature":20.0}' >/dev/null
+api POST "/api/v1/windows/$US2/readings" '{"reading_id":"e","revision":1,"measured_at":"2026-10-01T00:00:04Z","temperature":20.0}' >/dev/null
+api GET "/api/v1/windows/$US2/evaluation" \
+  | python3 -c 'import sys,json;e=json.load(sys.stdin);print("verdict:",e["verdict"],"未知段:",[(s["start"],s["end"],s["duration_seconds"]) for s in e["unknown_segments"]])'
+
+echo "-- 21.4 跨窗复核同一微秒口径：上限 1.0002s -> fail（超限 1.0004s 严格超过，未知不掩盖）--"
+UC1=$(api POST "/api/v1/windows/$US1/certificates/issue" '{"note":"微秒窗1"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+UC2=$(api POST "/api/v1/windows/$US2/certificates/issue" '{"note":"微秒窗2"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+api POST /api/v1/cross-window-reviews "{\"certificate_ids\":[$UC1,$UC2],\"max_continuous_exceed_seconds\":1.0002}" \
+  | python3 -c 'import sys,json;d=json.load(sys.stdin);print("verdict:",d["verdict"],"最长连续超限:",d["max_continuous_exceeded_seconds"],"s 未知总时长:",d["unknown_seconds"],"s");print("分段:",[(s["status"],s["duration_seconds"],s["source"]["certificate_id"]) for s in d["segments"]])'
+
+echo "-- 21.5 上限恰好 1.0004s：不严格超过但有 0.0004s 未知 -> pending --"
+api POST /api/v1/cross-window-reviews "{\"certificate_ids\":[$UC1,$UC2],\"max_continuous_exceed_seconds\":1.0004}" \
+  | python3 -c 'import sys,json;d=json.load(sys.stdin);print("verdict:",d["verdict"],"has_unknown:",d["has_unknown"],"未知总时长:",d["unknown_seconds"],"s")'
+
+echo "-- 21.6 微秒数据下封存与核验照常：签发快照固化微秒结果，封存/解封/核验包流程不变 --"
+US_SEAL=$(api POST "/api/v1/windows/$US1/seals" "{\"certificate_id\":$UC1,\"reason\":\"微秒窗口封存\"}")
+echo "$US_SEAL" | python3 -c 'import sys,json;s=json.load(sys.stdin)["seal"];print("封存编号:",s["id"],"证据最长连续超限:",s["evidence"]["snapshot"]["evaluation"]["max_continuous_exceeded_seconds"],"s")'
+US_SEAL_ID=$(echo "$US_SEAL" | python3 -c 'import sys,json;print(json.load(sys.stdin)["seal"]["id"])')
+api POST "/api/v1/certificates/$UC1/verification-package" > /tmp/pkg-us.json
+python3 - <<'PY'
+import json, os, urllib.request
+p = json.load(open("/tmp/pkg-us.json"))
+req = urllib.request.Request(
+    os.environ.get("BASE_URL", "http://localhost:8000") + "/api/v1/verification-packages/verify",
+    data=json.dumps(p).encode(), headers={"Content-Type": "application/json"}, method="POST")
+d = json.loads(urllib.request.urlopen(req).read())
+print("核验包: 签名可信 =", d["signature_check"]["trusted"], " 快照可信 =", d["snapshot_check"]["trusted"],
+      " state =", d["certificate"]["state"], " verdict =", d["certificate"]["verdict"])
+PY
+api POST "/api/v1/window-seals/$US_SEAL_ID/unseal" '{"reason":"演示结束解封"}' \
+  | python3 -c 'import sys,json;print("解封:",json.load(sys.stdin)["effect"])'

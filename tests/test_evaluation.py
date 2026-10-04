@@ -209,6 +209,76 @@ def test_fault_half_open_endpoint_does_not_mask_end_point():
     assert sum(s["duration_seconds"] for s in r["normal_segments"]) == 600.0
 
 
+# ------------------------------------------------------------ 微秒级采样时刻
+
+def us(microseconds: int) -> datetime:
+    """窗口起点 + 指定微秒数的采样时刻（带微秒的采样时刻）。"""
+    return WS + timedelta(microseconds=microseconds)
+
+
+def test_microsecond_exceed_strictly_over_threshold_fails():
+    # 持续 1.0004s 超限，阈值 1.0002s：按实际时长严格超过 -> 不合格
+    # （旧实现先舍入到毫秒得 1.000s，会误判为未超限）
+    r = evaluate(WS, WE, 18, 22, 1.0002, 4000,
+                 [(us(0), 23.0), (us(1_000_400), 20.0), (us(3_600_000_000), 20.0)])
+    assert r["verdict"] == "fail"
+    assert r["max_continuous_exceeded_seconds"] == 1.0004
+    assert r["exceeded_segments"][0]["duration_seconds"] == 1.0004
+
+
+def test_microsecond_exceed_exactly_at_threshold_not_fail():
+    # 持续恰好 1.0002s == 阈值：不严格超过 -> 不判不合格（无未知 -> 合格）
+    r = evaluate(WS, WE, 18, 22, 1.0002, 4000,
+                 [(us(0), 23.0), (us(1_000_200), 20.0), (us(3_600_000_000), 20.0)])
+    assert r["max_continuous_exceeded_seconds"] == 1.0002
+    assert r["verdict"] == "pass"
+
+
+def test_microsecond_exceed_one_us_below_threshold_not_fail():
+    # 持续 1.0001s < 阈值 1.0002s（差 1 微秒）-> 不判不合格
+    r = evaluate(WS, WE, 18, 22, 1.0002, 4000,
+                 [(us(0), 23.0), (us(1_000_100), 20.0), (us(3_600_000_000), 20.0)])
+    assert r["max_continuous_exceeded_seconds"] == 1.0001
+    assert r["verdict"] == "pass"
+
+
+def test_microsecond_unknown_segment_is_pending():
+    # 0.0004s 边界空白未知（不足 0.0005s）：任意正时长未知 -> 待定
+    r = evaluate(WS, WE, 18, 22, 300, 4000,
+                 [(us(400), 20.0), (us(3_600_000_000), 20.0)])
+    assert r["unknown_segments"][0]["duration_seconds"] == 0.0004
+    assert r["has_unknown"] is True
+    assert r["verdict"] == "pending"
+
+
+def test_microsecond_durations_presented_in_output():
+    # 输出时长呈现影响结论的微秒差异（不做毫秒舍入）
+    r = evaluate(WS, WE, 18, 22, 300, 4000,
+                 [(us(0), 23.0), (us(1_000_400), 20.0), (us(3_600_000_000), 20.0)])
+    assert r["exceeded_segments"][0]["duration_seconds"] == 1.0004
+    assert r["normal_segments"][0]["duration_seconds"] == 3598.9996
+    assert r["max_continuous_exceeded_seconds"] == 1.0004
+
+
+def test_microsecond_accumulation_across_segments():
+    # 多段相邻超限累计：0.5001s + 0.5003s = 1.0004s > 阈值 1.0002s -> 不合格
+    r = evaluate(WS, WE, 18, 22, 1.0002, 4000,
+                 [(us(0), 23.0), (us(500_100), 24.0),
+                  (us(1_000_400), 20.0), (us(3_600_000_000), 20.0)])
+    assert r["max_continuous_exceeded_seconds"] == 1.0004
+    assert r["verdict"] == "fail"
+
+
+def test_microsecond_fault_period_duration():
+    # 微秒级故障时段：遮蔽 0.0004s 即产生 0.0004s 未知 -> 待定
+    readings = [(us(0), 20.0), (us(3_600_000_000), 20.0)]
+    r = evaluate(WS, WE, 18, 22, 300, 4000, readings,
+                 fault_periods=[(us(1_000_000), us(1_000_400))])
+    assert r["fault_periods"][0]["duration_seconds"] == 0.0004
+    assert r["unknown_segments"][0]["duration_seconds"] == 0.0004
+    assert r["verdict"] == "pending"
+
+
 if __name__ == "__main__":
     import traceback
 
